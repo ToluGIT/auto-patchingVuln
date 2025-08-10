@@ -1,0 +1,498 @@
+schemaVersion: '0.3'
+description: 'Improved patch automation with safety checks and state management - FINAL FIX'
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  InstanceId:
+    type: String
+    description: EC2 Instance ID to patch
+  SnapshotId:
+    type: String
+    description: Pre-patch snapshot IDs for rollback
+    default: 'NONE'
+  AutomationAssumeRole:
+    type: String
+    description: IAM role for automation execution
+  SnsTopicArn:
+    type: String
+    description: SNS Topic ARN for notifications
+    default: ''
+
+mainSteps:
+  - name: ValidateInstance
+    action: aws:executeScript
+    timeoutSeconds: 60
+    inputs:
+      Runtime: python3.9
+      Handler: validate_instance
+      Script: |
+        def validate_instance(events, context):
+          import boto3
+          import json
+          
+          ec2 = boto3.client('ec2')
+          ssm = boto3.client('ssm')
+          instance_id = events['InstanceId']
+          
+          print(f"Validating instance: {instance_id}")
+          
+          # Check instance state
+          try:
+            response = ec2.describe_instances(InstanceIds=[instance_id])
+            if not response['Reservations']:
+              raise Exception(f'Instance {instance_id} not found')
+            
+            instance = response['Reservations'][0]['Instances'][0]
+            state = instance['State']['Name']
+            
+            if state != 'running':
+              raise Exception(f'Instance {instance_id} is not running: {state}')
+            
+            # Check SSM agent
+            ssm_response = ssm.describe_instance_information(
+              Filters=[{'Key': 'InstanceIds', 'Values': [instance_id]}]
+            )
+            
+            if not ssm_response['InstanceInformationList']:
+              raise Exception(f'SSM agent not running on {instance_id}')
+            
+            agent_info = ssm_response['InstanceInformationList'][0]
+            print(f"SSM Agent status: {agent_info['PingStatus']}")
+            
+            return {
+              'status': 'validated',
+              'instance_state': state,
+              'ssm_status': agent_info['PingStatus']
+            }
+            
+          except Exception as e:
+            print(f"Validation error: {str(e)}")
+            raise
+      InputPayload:
+        InstanceId: '{{ InstanceId }}'
+    outputs:
+      - Name: ValidationStatus
+        Selector: $.Payload.status
+        Type: String
+    onFailure: step:NotifyFailure
+    
+  - name: PrePatchAssessment
+    action: aws:runCommand
+    timeoutSeconds: 300
+    inputs:
+      DocumentName: AWS-RunShellScript
+      InstanceIds:
+        - '{{ InstanceId }}'
+      CloudWatchOutputConfig:
+        CloudWatchLogGroupName: /aws/ssm/patch-automation
+        CloudWatchOutputEnabled: true
+      Parameters:
+        commands:
+          - |
+            #!/bin/bash
+            echo "=== Pre-Patch Assessment ==="
+            
+            # Check disk space
+            echo "Checking disk space..."
+            DISK_USAGE=$(df -h / | awk 'NR==2 {print $5}' | sed 's/%//')
+            echo "Root disk usage: ${DISK_USAGE}%"
+            
+            if [ $DISK_USAGE -gt 85 ]; then
+              echo "ERROR: Insufficient disk space (${DISK_USAGE}% used)"
+              exit 1
+            fi
+            
+            # Check critical services
+            echo "Checking critical services..."
+            CRITICAL_SERVICES="sshd"
+            
+            # Add more services based on instance type
+            if systemctl list-units --type=service | grep -q "apache2\|httpd"; then
+              CRITICAL_SERVICES="$CRITICAL_SERVICES apache2 httpd"
+            fi
+            
+            if systemctl list-units --type=service | grep -q "nginx"; then
+              CRITICAL_SERVICES="$CRITICAL_SERVICES nginx"
+            fi
+            
+            for service in $CRITICAL_SERVICES; do
+              if systemctl is-enabled $service 2>/dev/null; then
+                if ! systemctl is-active --quiet $service; then
+                  echo "WARNING: Critical service $service is not running"
+                fi
+              fi
+            done
+            
+            # Save current package list
+            echo "Saving current package list..."
+            if [ -f /etc/debian_version ]; then
+              dpkg -l > /tmp/pre-patch-packages-$(date +%Y%m%d-%H%M%S).log
+              apt-get update
+              echo "Available updates:"
+              apt list --upgradable 2>/dev/null | head -20
+            elif [ -f /etc/redhat-release ]; then
+              rpm -qa > /tmp/pre-patch-packages-$(date +%Y%m%d-%H%M%S).log
+              yum check-update || true
+            fi
+            
+            echo "Pre-patch assessment completed successfully"
+            echo "COMMAND_ID=$(echo $AWS_SSM_COMMAND_ID)"
+    outputs:
+      - Name: PrePatchCommandId
+        Selector: $.Command.CommandId
+        Type: String
+    onFailure: step:NotifyFailure
+    
+  - name: CreateRestorePoint
+    action: aws:executeScript
+    timeoutSeconds: 120
+    inputs:
+      Runtime: python3.9
+      Handler: create_restore_point
+      Script: |
+        def create_restore_point(events, context):
+          import boto3
+          import json
+          from datetime import datetime
+          
+          instance_id = events['InstanceId']
+          snapshot_ids = events['SnapshotId']
+          # Fix: Get the actual command ID from the resolved parameter
+          pre_patch_command_id = events.get('PrePatchCommandId', 'UNKNOWN')
+          
+          # Validate that we got a real command ID, not a template variable
+          if pre_patch_command_id.startswith('{{') or pre_patch_command_id == 'UNKNOWN':
+            print(f"Warning: PrePatchCommandId not properly resolved: {pre_patch_command_id}")
+            pre_patch_command_id = 'COMMAND_ID_NOT_RESOLVED'
+          
+          # Store restore point information
+          ssm = boto3.client('ssm')
+          
+          restore_point = {
+            'instance_id': instance_id,
+            'timestamp': datetime.now().isoformat(),
+            'snapshots': snapshot_ids,
+            'pre_patch_command': pre_patch_command_id
+          }
+          
+          # Store as SSM parameter for potential rollback
+          try:
+            param_name = f'/patch-automation/restore-points/{instance_id}/{datetime.now().strftime("%Y%m%d-%H%M%S")}'
+            
+            # Try to create parameter first (without tags to avoid conflict)
+            try:
+              ssm.put_parameter(
+                Name=param_name,
+                Value=json.dumps(restore_point),
+                Type='String',
+                Overwrite=True
+              )
+            except Exception as param_error:
+              # If parameter doesn't exist, create without Overwrite
+              ssm.put_parameter(
+                Name=param_name,
+                Value=json.dumps(restore_point),
+                Type='String',
+                Tags=[
+                  {'Key': 'InstanceId', 'Value': instance_id},
+                  {'Key': 'Purpose', 'Value': 'PatchRestorePoint'}
+                ]
+              )
+            
+            # Add tags separately if parameter was created with Overwrite=True
+            try:
+              ssm.add_tags_to_resource(
+                ResourceType='Parameter',
+                ResourceId=param_name,
+                Tags=[
+                  {'Key': 'InstanceId', 'Value': instance_id},
+                  {'Key': 'Purpose', 'Value': 'PatchRestorePoint'}
+                ]
+              )
+            except Exception as tag_error:
+              print(f"Warning: Could not add tags: {str(tag_error)}")
+            
+            print(f"Restore point stored in parameter: {param_name}")
+            print(f"Restore point data: {json.dumps(restore_point, indent=2)}")
+          except Exception as e:
+            print(f"Error storing restore point: {str(e)}")
+          
+          return {'status': 'restore_point_created'}
+      InputPayload:
+        InstanceId: '{{ InstanceId }}'
+        SnapshotId: '{{ SnapshotId }}'
+        PrePatchCommandId: '{{ PrePatchAssessment.PrePatchCommandId }}'
+    
+  - name: ApplySecurityPatches
+    action: aws:runCommand
+    timeoutSeconds: 3600
+    inputs:
+      DocumentName: AWS-RunPatchBaseline
+      InstanceIds:
+        - '{{ InstanceId }}'
+      CloudWatchOutputConfig:
+        CloudWatchLogGroupName: /aws/ssm/patch-automation
+        CloudWatchOutputEnabled: true
+      Parameters:
+        Operation: Install
+        RebootOption: NoReboot
+    outputs:
+      - Name: PatchStatus
+        Selector: $.Status
+        Type: String
+    onFailure: step:RollbackAssessment
+    
+  - name: PostPatchValidation
+    action: aws:runCommand
+    timeoutSeconds: 300
+    inputs:
+      DocumentName: AWS-RunShellScript
+      InstanceIds:
+        - '{{ InstanceId }}'
+      CloudWatchOutputConfig:
+        CloudWatchLogGroupName: /aws/ssm/patch-automation
+        CloudWatchOutputEnabled: true
+      Parameters:
+        commands:
+          - |
+            #!/bin/bash
+            echo "=== Post-Patch Validation ==="
+            
+            # Check if patches were applied
+            echo "Checking patch status..."
+            if [ -f /etc/debian_version ]; then
+              apt-get update
+              UPDATES_AVAILABLE=$(apt list --upgradable 2>/dev/null | grep -c "upgradable")
+              echo "Updates still available: $UPDATES_AVAILABLE"
+            elif [ -f /etc/redhat-release ]; then
+              UPDATES_AVAILABLE=$(yum check-update 2>/dev/null | grep -v "^$" | wc -l)
+              echo "Updates still available: $UPDATES_AVAILABLE"
+            fi
+            
+            # Check critical services are still running
+            echo "Checking critical services..."
+            FAILED_SERVICES=""
+            
+            for service in sshd; do
+              if ! systemctl is-active --quiet $service; then
+                FAILED_SERVICES="$FAILED_SERVICES $service"
+              fi
+            done
+            
+            if [ -n "$FAILED_SERVICES" ]; then
+              echo "ERROR: Critical services not running:$FAILED_SERVICES"
+              exit 1
+            fi
+            
+            # Check if reboot is required
+            REBOOT_REQUIRED="NO"
+            if [ -f /var/run/reboot-required ]; then
+              REBOOT_REQUIRED="YES"
+              echo "REBOOT REQUIRED"
+            fi
+            
+            # Save post-patch package list
+            if [ -f /etc/debian_version ]; then
+              dpkg -l > /tmp/post-patch-packages-$(date +%Y%m%d-%H%M%S).log
+            elif [ -f /etc/redhat-release ]; then
+              rpm -qa > /tmp/post-patch-packages-$(date +%Y%m%d-%H%M%S).log
+            fi
+            
+            echo "REBOOT_REQUIRED=$REBOOT_REQUIRED"
+            echo "Post-patch validation completed"
+    outputs:
+      - Name: RebootRequired
+        Selector: $.Output
+        Type: String
+    onFailure: step:RollbackAssessment
+    
+  - name: ScheduleRebootIfNeeded
+    action: aws:executeScript
+    timeoutSeconds: 60
+    inputs:
+      Runtime: python3.9
+      Handler: schedule_reboot
+      Script: |
+        def schedule_reboot(events, context):
+          import boto3
+          
+          instance_id = events['InstanceId']
+          output = events['ValidationOutput']
+          
+          if 'REBOOT_REQUIRED=YES' in output:
+            ssm = boto3.client('ssm')
+            
+            # Schedule reboot in 2 minutes
+            response = ssm.send_command(
+              InstanceIds=[instance_id],
+              DocumentName='AWS-RunShellScript',
+              Parameters={
+                'commands': [
+                  'echo "Scheduling system reboot for patch completion..."',
+                  'sudo shutdown -r +2 "System reboot for security patches - scheduled by automation"'
+                ]
+              }
+            )
+            
+            return {
+              'status': 'reboot_scheduled',
+              'command_id': response['Command']['CommandId']
+            }
+          
+          return {'status': 'no_reboot_needed'}
+      InputPayload:
+        InstanceId: '{{ InstanceId }}'
+        ValidationOutput: '{{ PostPatchValidation.RebootRequired }}'
+    outputs:
+      - Name: RebootStatus
+        Selector: $.Payload.status
+        Type: String
+    
+  - name: UpdatePatchState
+    action: aws:executeScript
+    timeoutSeconds: 60
+    inputs:
+      Runtime: python3.9
+      Handler: update_state
+      Script: |
+        def update_state(events, context):
+          import boto3
+          from datetime import datetime
+          
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table('PatchExecutionState')
+          
+          try:
+            # Update state to completed
+            table.update_item(
+              Key={'instance_id': events['InstanceId']},
+              UpdateExpression='SET #status = :completed, completed_at = :time, reboot_scheduled = :reboot',
+              ExpressionAttributeNames={'#status': 'status'},
+              ExpressionAttributeValues={
+                ':completed': 'COMPLETED',
+                ':time': datetime.now().isoformat(),
+                ':reboot': events['RebootStatus'] == 'reboot_scheduled'
+              }
+            )
+            
+            return {'status': 'state_updated'}
+            
+          except Exception as e:
+            print(f"Error updating state: {str(e)}")
+            return {'status': 'update_failed', 'error': str(e)}
+      InputPayload:
+        InstanceId: '{{ InstanceId }}'
+        RebootStatus: '{{ ScheduleRebootIfNeeded.RebootStatus }}'
+    
+  - name: SendSuccessNotification
+    action: aws:executeScript
+    timeoutSeconds: 60
+    isEnd: true
+    inputs:
+      Runtime: python3.9
+      Handler: send_notification
+      Script: |
+        def send_notification(events, context):
+          import boto3
+          
+          sns = boto3.client('sns')
+          # Fix: Get SNS topic ARN from parameters instead of environment
+          topic_arn = events.get('SnsTopicArn', '')
+          
+          if not topic_arn or topic_arn == '':
+            print("No SNS topic configured")
+            return {'status': 'no_notification'}
+          
+          message = f"""
+          Patch Automation Completed Successfully
+          
+          Instance ID: {events['InstanceId']}
+          Patch Status: {events['PatchStatus']}
+          Reboot Status: {events['RebootStatus']}
+          Snapshots: {events['SnapshotId']}
+          
+          The instance has been successfully patched with the latest security updates.
+          """
+          
+          if events['RebootStatus'] == 'reboot_scheduled':
+            message += "\n\nNote: A system reboot has been scheduled in 2 minutes to complete the patch installation."
+          
+          try:
+            response = sns.publish(
+              TopicArn=topic_arn,
+              Subject=f"Patch Success - {events['InstanceId']}",
+              Message=message
+            )
+            print(f"SNS notification sent successfully. MessageId: {response['MessageId']}")
+            return {'status': 'notification_sent'}
+          except Exception as e:
+            print(f"Error sending notification: {str(e)}")
+            return {'status': 'notification_failed', 'error': str(e)}
+      InputPayload:
+        InstanceId: '{{ InstanceId }}'
+        PatchStatus: '{{ ApplySecurityPatches.PatchStatus }}'
+        RebootStatus: '{{ ScheduleRebootIfNeeded.RebootStatus }}'
+        SnapshotId: '{{ SnapshotId }}'
+        SnsTopicArn: '{{ SnsTopicArn }}'
+    
+  - name: RollbackAssessment
+    action: aws:executeScript
+    timeoutSeconds: 120
+    inputs:
+      Runtime: python3.9
+      Handler: assess_rollback
+      Script: |
+        def assess_rollback(events, context):
+          import boto3
+          
+          print(f"Assessing rollback need for instance {events['InstanceId']}")
+          
+          # Update state to failed
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table('PatchExecutionState')
+          
+          table.update_item(
+            Key={'instance_id': events['InstanceId']},
+            UpdateExpression='SET #status = :failed',
+            ExpressionAttributeNames={'#status': 'status'},
+            ExpressionAttributeValues={':failed': 'FAILED'}
+          )
+          
+          return {'status': 'rollback_assessment_complete'}
+      InputPayload:
+        InstanceId: '{{ InstanceId }}'
+        SnapshotId: '{{ SnapshotId }}'
+    nextStep: NotifyFailure
+    
+  - name: NotifyFailure
+    action: aws:executeScript
+    timeoutSeconds: 60
+    isEnd: true
+    inputs:
+      Runtime: python3.9
+      Handler: notify_failure
+      Script: |
+        def notify_failure(events, context):
+          import boto3
+          
+          sns = boto3.client('sns')
+          # Fix: Get SNS topic ARN from parameters
+          topic_arn = events.get('SnsTopicArn', '')
+          
+          if topic_arn and topic_arn != '':
+            try:
+              response = sns.publish(
+                TopicArn=topic_arn,
+                Subject=f"Patch Failed - {events['InstanceId']}",
+                Message=f"Patch automation failed for instance {events['InstanceId']}. Manual intervention required.\n\nSnapshots available: {events.get('SnapshotId', 'None')}"
+              )
+              print(f"Failure notification sent successfully. MessageId: {response['MessageId']}")
+            except Exception as e:
+              print(f"Error sending notification: {str(e)}")
+          else:
+            print("No SNS topic configured for failure notification")
+          
+          return {'status': 'failure_notified'}
+      InputPayload:
+        InstanceId: '{{ InstanceId }}'
+        SnapshotId: '{{ SnapshotId }}'
+        SnsTopicArn: '{{ SnsTopicArn }}'
