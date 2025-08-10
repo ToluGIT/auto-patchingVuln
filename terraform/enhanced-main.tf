@@ -360,8 +360,8 @@ resource "aws_lambda_function" "patch_deduplication" {
       SNS_TOPIC_ARN           = aws_sns_topic.patch_notifications.arn
       AUTOMATION_DOCUMENT_NAME = aws_ssm_document.improved_patch_automation.name
       AUTOMATION_ROLE_ARN     = aws_iam_role.automation_execution_role.arn
-      MAINTENANCE_WINDOW_START = "13"  # 1 PM
-      MAINTENANCE_WINDOW_END   = "20"  # 7 PM
+      MAINTENANCE_WINDOW_START = "18"  # 6 PM (for testing - outside current time)
+      MAINTENANCE_WINDOW_END   = "22"  # 10 PM
     }
   }
   
@@ -379,6 +379,116 @@ resource "aws_lambda_function" "patch_deduplication" {
     aws_iam_role_policy_attachment.lambda_vpc_execution,
     aws_cloudwatch_log_group.lambda_logs,
   ]
+}
+
+# Maintenance Scheduler Lambda package
+data "archive_file" "maintenance_scheduler_package" {
+  type        = "zip"
+  source_file = "${path.module}/../lambda/maintenance_scheduler.py"
+  output_path = "${path.module}/maintenance_scheduler_package.zip"
+}
+
+# Maintenance Scheduler Lambda function
+resource "aws_lambda_function" "maintenance_scheduler" {
+  filename         = data.archive_file.maintenance_scheduler_package.output_path
+  function_name    = "patch-maintenance-scheduler"
+  role            = aws_iam_role.maintenance_scheduler_role.arn
+  handler         = "maintenance_scheduler.lambda_handler"
+  source_code_hash = data.archive_file.maintenance_scheduler_package.output_base64sha256
+  runtime         = "python3.9"
+  timeout         = 300
+  memory_size     = 256
+  
+  # VPC Configuration for security (same as main Lambda)
+  vpc_config {
+    subnet_ids         = aws_subnet.lambda_subnet[*].id
+    security_group_ids = [aws_security_group.lambda_sg.id]
+  }
+  
+  environment {
+    variables = {
+      STATE_TABLE_NAME               = aws_dynamodb_table.patch_execution_state.name
+      MAINTENANCE_WINDOW_START       = "18"  # 6 PM UTC (for testing - same as main Lambda)
+      MAINTENANCE_WINDOW_END         = "22"  # 10 PM UTC (for testing - same as main Lambda)
+      DEDUPLICATION_FUNCTION_NAME    = aws_lambda_function.patch_deduplication.function_name
+    }
+  }
+  
+  tags = {
+    Name        = "PatchMaintenanceScheduler"
+    Environment = var.environment
+  }
+  
+  depends_on = [
+    aws_iam_role_policy_attachment.maintenance_scheduler_vpc_execution,
+    aws_cloudwatch_log_group.maintenance_scheduler_logs,
+  ]
+}
+
+# IAM Role for Maintenance Scheduler Lambda
+resource "aws_iam_role" "maintenance_scheduler_role" {
+  name               = "PatchMaintenanceSchedulerRole"
+  assume_role_policy = file("${path.module}/policies/lambda-assume-role.json")
+  
+  tags = {
+    Name        = "PatchMaintenanceSchedulerRole"
+    Environment = var.environment
+  }
+}
+
+# IAM policy for maintenance scheduler
+resource "aws_iam_role_policy" "maintenance_scheduler_policy" {
+  name = "MaintenanceSchedulerPolicy"
+  role = aws_iam_role.maintenance_scheduler_role.id
+  
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "dynamodb:Scan",
+          "dynamodb:GetItem",
+          "dynamodb:UpdateItem",
+          "dynamodb:PutItem"
+        ]
+        Resource = aws_dynamodb_table.patch_execution_state.arn
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "lambda:InvokeFunction"
+        ]
+        Resource = aws_lambda_function.patch_deduplication.arn
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "arn:aws:logs:*:*:*"
+      }
+    ]
+  })
+}
+
+# VPC execution policy for maintenance scheduler Lambda
+resource "aws_iam_role_policy_attachment" "maintenance_scheduler_vpc_execution" {
+  role       = aws_iam_role.maintenance_scheduler_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+}
+
+# CloudWatch Log Group for Maintenance Scheduler
+resource "aws_cloudwatch_log_group" "maintenance_scheduler_logs" {
+  name              = "/aws/lambda/patch-maintenance-scheduler"
+  retention_in_days = 7
+  
+  tags = {
+    Name        = "MaintenanceSchedulerLogs"
+    Environment = var.environment
+  }
 }
 
 
@@ -409,7 +519,7 @@ resource "aws_ssm_document" "improved_patch_automation" {
   name            = "ImprovedPatchAutomation"
   document_type   = "Automation"
   document_format = "YAML"
-  content         = file("${path.module}/../documents/thoughts.yaml")
+  content         = file("${path.module}/../documents/improved-patch-automation-final.yaml")
   
   tags = {
     Name        = "ImprovedPatchAutomation"
@@ -438,20 +548,48 @@ resource "aws_cloudwatch_event_rule" "inspector_findings" {
   }
 }
 
-# EventBridge Target
+# EventBridge Rule for Maintenance Window Scheduler
+resource "aws_cloudwatch_event_rule" "maintenance_scheduler" {
+  name                = "patch-maintenance-scheduler"
+  description         = "Trigger scheduled patches during maintenance window"
+  schedule_expression = "cron(0 13-20 * * ? *)"  # Every hour from 1 PM to 7 PM UTC
+  
+  tags = {
+    Name        = "MaintenanceSchedulerRule"
+    Environment = var.environment
+  }
+}
+
+# EventBridge Target for Inspector findings
 resource "aws_cloudwatch_event_target" "lambda_target" {
   rule      = aws_cloudwatch_event_rule.inspector_findings.name
   target_id = "PatchDeduplicationLambda"
   arn       = aws_lambda_function.patch_deduplication.arn
 }
 
-# Lambda permission for EventBridge
+# EventBridge Target for Maintenance Scheduler
+resource "aws_cloudwatch_event_target" "maintenance_scheduler_target" {
+  rule      = aws_cloudwatch_event_rule.maintenance_scheduler.name
+  target_id = "MaintenanceSchedulerLambda"
+  arn       = aws_lambda_function.maintenance_scheduler.arn
+}
+
+# Lambda permission for EventBridge (Inspector findings)
 resource "aws_lambda_permission" "eventbridge_invoke" {
   statement_id  = "AllowEventBridgeInvoke"
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.patch_deduplication.function_name
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.inspector_findings.arn
+}
+
+# Lambda permission for EventBridge (Maintenance scheduler)
+resource "aws_lambda_permission" "maintenance_scheduler_eventbridge_invoke" {
+  statement_id  = "AllowEventBridgeInvokeScheduler"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.maintenance_scheduler.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.maintenance_scheduler.arn
 }
 
 # CloudWatch Log Group for SSM
@@ -519,10 +657,12 @@ resource "aws_cloudwatch_dashboard" "patch_monitoring" {
         
         properties = {
           metrics = [
-            ["AWS/Lambda", "Invocations", "FunctionName", aws_lambda_function.patch_deduplication.function_name, { stat = "Sum", label = "Total Invocations" }],
-            [".", "Errors", ".", ".", { stat = "Sum", label = "Errors" }],
-            [".", "Duration", ".", ".", { stat = "Average", label = "Avg Duration" }],
-            [".", "Throttles", ".", ".", { stat = "Sum", label = "Throttles" }]
+            ["AWS/Lambda", "Invocations", "FunctionName", aws_lambda_function.patch_deduplication.function_name, { stat = "Sum", label = "Deduplication Invocations" }],
+            [".", "Errors", ".", ".", { stat = "Sum", label = "Deduplication Errors" }],
+            [".", "Duration", ".", ".", { stat = "Average", label = "Deduplication Avg Duration" }],
+            [".", "Invocations", "FunctionName", aws_lambda_function.maintenance_scheduler.function_name, { stat = "Sum", label = "Scheduler Invocations" }],
+            [".", "Errors", ".", ".", { stat = "Sum", label = "Scheduler Errors" }],
+            [".", "Duration", ".", ".", { stat = "Average", label = "Scheduler Avg Duration" }]
           ]
           view    = "timeSeries"
           stacked = false
