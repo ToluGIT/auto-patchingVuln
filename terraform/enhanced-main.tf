@@ -295,11 +295,123 @@ resource "aws_iam_role" "lambda_execution_role" {
   }
 }
 
-# Enhanced Lambda policy with VPC permissions
+# Enhanced Lambda policy with VPC permissions and dynamic KMS key
 resource "aws_iam_role_policy" "lambda_execution_policy" {
-  name   = "PatchDeduplicationLambdaPolicy"
-  role   = aws_iam_role.lambda_execution_role.id
-  policy = file("${path.module}/policies/lambda-execution-policy.json")
+  name = "PatchDeduplicationLambdaPolicy"
+  role = aws_iam_role.lambda_execution_role.id
+  
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "arn:aws:logs:*:*:log-group:/aws/lambda/patch-deduplication-function*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem",
+          "dynamodb:Query"
+        ]
+        Resource = aws_dynamodb_table.patch_execution_state.arn
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ssm:StartAutomationExecution",
+          "ssm:GetAutomationExecution",
+          "ssm:StopAutomationExecution",
+          "ssm:SendCommand",
+          "ssm:ListCommandInvocations",
+          "ssm:GetCommandInvocation",
+          "ssm:DescribeInstancePatches",
+          "ssm:DescribeInstancePatchStates"
+        ]
+        Resource = [
+          "arn:aws:ssm:*:*:automation-definition/ImprovedPatchAutomation:*",
+          "arn:aws:ssm:*:*:automation-execution/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ssm:DescribeInstanceInformation"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ec2:DescribeInstances",
+          "ec2:DescribeInstanceAttribute",
+          "ec2:DescribeVolumes"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ec2:CreateSnapshot",
+          "ec2:DescribeSnapshots",
+          "ec2:CreateTags"
+        ]
+        Resource = [
+          "arn:aws:ec2:*:*:volume/*",
+          "arn:aws:ec2:*:*:snapshot/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "sns:Publish"
+        ]
+        Resource = aws_sns_topic.patch_notifications.arn
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "iam:PassRole"
+        ]
+        Resource = aws_iam_role.automation_execution_role.arn
+        Condition = {
+          StringEquals = {
+            "iam:PassedToService" = "ssm.amazonaws.com"
+          }
+        }
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "sqs:SendMessage"
+        ]
+        Resource = aws_sqs_queue.lambda_dlq.arn
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "kms:GenerateDataKey",
+          "kms:Decrypt"
+        ]
+        Resource = aws_kms_key.patch_automation_key.arn
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ec2:CreateNetworkInterface",
+          "ec2:DescribeNetworkInterfaces",
+          "ec2:DeleteNetworkInterface"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
 }
 
 # VPC execution policy for Lambda
@@ -360,8 +472,8 @@ resource "aws_lambda_function" "patch_deduplication" {
       SNS_TOPIC_ARN           = aws_sns_topic.patch_notifications.arn
       AUTOMATION_DOCUMENT_NAME = aws_ssm_document.improved_patch_automation.name
       AUTOMATION_ROLE_ARN     = aws_iam_role.automation_execution_role.arn
-      MAINTENANCE_WINDOW_START = "18"  # 6 PM (for testing - outside current time)
-      MAINTENANCE_WINDOW_END   = "22"  # 10 PM
+      MAINTENANCE_WINDOW_START = "2"  # 2 AM UTC (current time for testing) 
+      MAINTENANCE_WINDOW_END   = "6"  # 6 AM UTC (4-hour window for testing)
     }
   }
   
@@ -408,8 +520,8 @@ resource "aws_lambda_function" "maintenance_scheduler" {
   environment {
     variables = {
       STATE_TABLE_NAME               = aws_dynamodb_table.patch_execution_state.name
-      MAINTENANCE_WINDOW_START       = "18"  # 6 PM UTC (for testing - same as main Lambda)
-      MAINTENANCE_WINDOW_END         = "22"  # 10 PM UTC (for testing - same as main Lambda)
+      MAINTENANCE_WINDOW_START       = "2"  # 2 AM UTC (current time for testing)
+      MAINTENANCE_WINDOW_END         = "6"  # 6 AM UTC (4-hour window for testing)
       DEDUPLICATION_FUNCTION_NAME    = aws_lambda_function.patch_deduplication.function_name
     }
   }
@@ -552,7 +664,7 @@ resource "aws_cloudwatch_event_rule" "inspector_findings" {
 resource "aws_cloudwatch_event_rule" "maintenance_scheduler" {
   name                = "patch-maintenance-scheduler"
   description         = "Trigger scheduled patches during maintenance window"
-  schedule_expression = "cron(0 13-20 * * ? *)"  # Every hour from 1 PM to 7 PM UTC
+  schedule_expression = "cron(0 2-6 * * ? *)"  # Every hour from 2 AM to 6 AM UTC (for testing)
   
   tags = {
     Name        = "MaintenanceSchedulerRule"

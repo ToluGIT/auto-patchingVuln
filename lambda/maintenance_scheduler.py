@@ -6,7 +6,7 @@ from botocore.exceptions import ClientError
 import logging
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Initialize AWS clients
@@ -24,7 +24,8 @@ def lambda_handler(event, context):
     Maintenance scheduler Lambda function
     Runs every hour during maintenance window to process scheduled patches
     """
-    logger.info("Maintenance scheduler started")
+    logger.info(f"Maintenance scheduler started at {datetime.utcnow().isoformat()}")
+    logger.info(f"Current maintenance window: {MAINTENANCE_START}:00 - {MAINTENANCE_END}:00 UTC")
     
     try:
         # Check if we're currently in maintenance window
@@ -72,12 +73,16 @@ def lambda_handler(event, context):
 def is_in_maintenance_window():
     """Check if current time is within maintenance window"""
     current_hour = datetime.utcnow().hour
+    logger.info(f"Current hour: {current_hour}, Maintenance window: {MAINTENANCE_START}-{MAINTENANCE_END}")
     
     # Handle maintenance windows that cross midnight
     if MAINTENANCE_START > MAINTENANCE_END:
-        return current_hour >= MAINTENANCE_START or current_hour < MAINTENANCE_END
+        in_window = current_hour >= MAINTENANCE_START or current_hour < MAINTENANCE_END
     else:
-        return MAINTENANCE_START <= current_hour < MAINTENANCE_END
+        in_window = MAINTENANCE_START <= current_hour < MAINTENANCE_END
+    
+    logger.info(f"In maintenance window: {in_window}")
+    return in_window
 
 def get_scheduled_patches():
     """Get all items with SCHEDULED status from DynamoDB"""
