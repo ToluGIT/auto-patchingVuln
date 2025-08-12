@@ -13,21 +13,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 TERRAFORM_DIR="$PROJECT_ROOT/terraform"
 
-echo -e "${BLUE}🚀 AWS Vulnerability Auto-Patching System Deployment${NC}"
+echo -e "${BLUE}AWS Vulnerability Auto-Patching System Deployment${NC}"
 echo "============================================================="
 
 # Function to print step headers
 print_step() {
-    echo -e "\n${YELLOW}📋 Step $1: $2${NC}"
+    echo -e "\n${YELLOW}Step $1: $2${NC}"
     echo "----------------------------------------"
 }
 
 # Function to check command exit status
 check_status() {
     if [ $? -eq 0 ]; then
-        echo -e "${GREEN}✅ $1${NC}"
+        echo -e "${GREEN}PASS: $1${NC}"
     else
-        echo -e "${RED}❌ $1 failed${NC}"
+        echo -e "${RED}FAIL: $1 failed${NC}"
         exit 1
     fi
 }
@@ -38,35 +38,35 @@ validate_prerequisites() {
     
     # Check if AWS CLI is installed
     if command -v aws &> /dev/null; then
-        echo "✓ AWS CLI is installed"
+        echo "OK: AWS CLI is installed"
     else
-        echo -e "${RED}❌ AWS CLI is not installed. Please install it first.${NC}"
+        echo -e "${RED}ERROR: AWS CLI is not installed. Please install it first.${NC}"
         exit 1
     fi
     
     # Check if Terraform is installed
     if command -v terraform &> /dev/null; then
-        echo "✓ Terraform is installed"
+        echo "OK: Terraform is installed"
         terraform version
     else
-        echo -e "${RED}❌ Terraform is not installed. Please install it first.${NC}"
+        echo -e "${RED}ERROR: Terraform is not installed. Please install it first.${NC}"
         exit 1
     fi
     
     # Check AWS credentials
     if aws sts get-caller-identity &> /dev/null; then
-        echo "✓ AWS credentials are configured"
+        echo "OK: AWS credentials are configured"
         aws sts get-caller-identity --query '[Account, Arn]' --output table
     else
-        echo -e "${RED}❌ AWS credentials not configured or invalid.${NC}"
+        echo -e "${RED}ERROR: AWS credentials not configured or invalid.${NC}"
         exit 1
     fi
     
     # Check if terraform.tfvars exists
     if [ -f "$TERRAFORM_DIR/terraform.tfvars" ]; then
-        echo "✓ terraform.tfvars file exists"
+        echo "OK: terraform.tfvars file exists"
     else
-        echo -e "${RED}❌ terraform.tfvars file not found.${NC}"
+        echo -e "${RED}ERROR: terraform.tfvars file not found.${NC}"
         echo "Please create $TERRAFORM_DIR/terraform.tfvars with required variables."
         echo "See $TERRAFORM_DIR/terraform.tfvars.example for template."
         exit 1
@@ -82,9 +82,9 @@ validate_prerequisites() {
     
     for file in "${required_files[@]}"; do
         if [ -f "$file" ]; then
-            echo "✓ $(basename "$file") exists"
+            echo "OK: $(basename "$file") exists"
         else
-            echo -e "${RED}❌ Required file missing: $file${NC}"
+            echo -e "${RED}ERROR: Required file missing: $file${NC}"
             exit 1
         fi
     done
@@ -140,40 +140,40 @@ verify_deployment() {
     echo -n "Lambda function: "
     LAMBDA_STATE=$(aws lambda get-function --function-name patch-deduplication-function --query 'Configuration.State' --output text 2>/dev/null || echo "NOT_FOUND")
     if [ "$LAMBDA_STATE" = "Active" ]; then
-        echo -e "${GREEN}✓ Active${NC}"
+        echo -e "${GREEN}OK: Active${NC}"
     else
-        echo -e "${RED}✗ $LAMBDA_STATE${NC}"
+        echo -e "${RED}ERROR: $LAMBDA_STATE${NC}"
     fi
     
     # Check DynamoDB table
     echo -n "DynamoDB table: "
     DYNAMODB_STATUS=$(aws dynamodb describe-table --table-name PatchExecutionState --query 'Table.TableStatus' --output text 2>/dev/null || echo "NOT_FOUND")
     if [ "$DYNAMODB_STATUS" = "ACTIVE" ]; then
-        echo -e "${GREEN}✓ Active${NC}"
+        echo -e "${GREEN}OK: Active${NC}"
     else
-        echo -e "${RED}✗ $DYNAMODB_STATUS${NC}"
+        echo -e "${RED}ERROR: $DYNAMODB_STATUS${NC}"
     fi
     
     # Check EventBridge rule
     echo -n "EventBridge rule: "
     EVENTBRIDGE_STATE=$(aws events describe-rule --name inspector-vulnerability-findings --query 'State' --output text 2>/dev/null || echo "NOT_FOUND")
     if [ "$EVENTBRIDGE_STATE" = "ENABLED" ]; then
-        echo -e "${GREEN}✓ Enabled${NC}"
+        echo -e "${GREEN}OK: Enabled${NC}"
     else
-        echo -e "${RED}✗ $EVENTBRIDGE_STATE${NC}"
+        echo -e "${RED}ERROR: $EVENTBRIDGE_STATE${NC}"
     fi
     
     # Check SSM document
     echo -n "SSM document: "
     SSM_STATUS=$(aws ssm describe-document --name ImprovedPatchAutomation --query 'Document.Status' --output text 2>/dev/null || echo "NOT_FOUND")
     if [ "$SSM_STATUS" = "Active" ]; then
-        echo -e "${GREEN}✓ Active${NC}"
+        echo -e "${GREEN}OK: Active${NC}"
     else
-        echo -e "${RED}✗ $SSM_STATUS${NC}"
+        echo -e "${RED}ERROR: $SSM_STATUS${NC}"
     fi
     
     # Display important outputs
-    echo -e "\n${BLUE}📊 Deployment Outputs:${NC}"
+    echo -e "\n${BLUE}Deployment Outputs:${NC}"
     echo "----------------------------------------"
     terraform output
 }
@@ -186,50 +186,50 @@ post_deployment_setup() {
     INSPECTOR_STATUS=$(aws inspector2 get-configuration --query 'status' --output text 2>/dev/null || echo "DISABLED")
     
     if [ "$INSPECTOR_STATUS" != "ENABLED" ]; then
-        echo -e "${YELLOW}⚠️  Inspector2 is not enabled. Enabling now...${NC}"
+        echo -e "${YELLOW}WARNING: Inspector2 is not enabled. Enabling now...${NC}"
         aws inspector2 enable --resource-types EC2 ECR
-        echo "✓ Inspector2 enabled for EC2 and ECR resources"
+        echo "OK: Inspector2 enabled for EC2 and ECR resources"
     else
-        echo "✓ Inspector2 is already enabled"
+        echo "OK: Inspector2 is already enabled"
     fi
     
     # Get SNS topic ARN
     SNS_TOPIC_ARN=$(terraform output -raw sns_topic_arn 2>/dev/null)
     
     if [ -n "$SNS_TOPIC_ARN" ]; then
-        echo -e "\n${YELLOW}📧 Email Subscription Setup:${NC}"
+        echo -e "\n${YELLOW}Email Subscription Setup:${NC}"
         echo "An email subscription has been created for SNS topic:"
         echo "$SNS_TOPIC_ARN"
-        echo -e "${YELLOW}Please check your email and confirm the subscription!${NC}"
+        echo -e "${YELLOW}Please check your email and confirm the subscription.${NC}"
         
         # Check subscription status
         echo -n "Checking subscription status: "
         CONFIRMED=$(aws sns list-subscriptions-by-topic --topic-arn "$SNS_TOPIC_ARN" --query 'Subscriptions[0].SubscriptionArn' --output text 2>/dev/null)
         if [[ "$CONFIRMED" == *"arn:aws:sns"* ]]; then
-            echo -e "${GREEN}✓ Confirmed${NC}"
+            echo -e "${GREEN}OK: Confirmed${NC}"
         else
-            echo -e "${YELLOW}⏳ Pending confirmation${NC}"
+            echo -e "${YELLOW}PENDING: Awaiting confirmation${NC}"
         fi
     fi
     
     # Display CloudWatch dashboard URL
     DASHBOARD_URL=$(terraform output -raw dashboard_url 2>/dev/null)
     if [ -n "$DASHBOARD_URL" ]; then
-        echo -e "\n${BLUE}📊 CloudWatch Dashboard:${NC}"
+        echo -e "\n${BLUE}CloudWatch Dashboard:${NC}"
         echo "$DASHBOARD_URL"
     fi
 }
 
 # Function to provide next steps
 show_next_steps() {
-    echo -e "\n${GREEN}🎉 Deployment Complete!${NC}"
+    echo -e "\n${GREEN}Deployment Complete${NC}"
     echo "============================================================="
     echo ""
     echo "Next steps:"
-    echo "1. 📧 Confirm your email subscription for SNS notifications"
-    echo "2. 🖥️  Create a test EC2 instance with AutoPatch=true tag"
-    echo "3. 🧪 Run the test suite: ./scripts/test.sh"
-    echo "4. 📊 Monitor the CloudWatch dashboard"
+    echo "1. Confirm your email subscription for SNS notifications"
+    echo "2. Create a test EC2 instance with AutoPatch=true tag"
+    echo "3. Run the test suite: ./scripts/test.sh"
+    echo "4. Monitor the CloudWatch dashboard"
     echo ""
     echo "Useful commands:"
     echo "• View Lambda logs: aws logs tail /aws/lambda/patch-deduplication-function --follow"

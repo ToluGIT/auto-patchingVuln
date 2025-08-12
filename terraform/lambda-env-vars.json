@@ -1,8 +1,0 @@
-{
-  "Variables": {
-    "STATE_TABLE_NAME": "PatchExecutionState",
-    "MAINTENANCE_WINDOW_START": "18",
-    "MAINTENANCE_WINDOW_END": "20",
-    "DEDUPLICATION_FUNCTION_NAME": "patch-deduplication-function"
-  }
-}
