@@ -2,7 +2,7 @@
 # AWS Vulnerability Auto-Patching
 
 
-**One-liner**: Event-driven,vulnerability remediation system that reduces security exposure time from weeks to hours while eliminating manual patching overhead.
+**One-liner**: Event-driven,vulnerability remediation system that reduces security exposure time while eliminating manual patching overhead.
 
 ---
 
@@ -30,7 +30,6 @@
 **4. Production-Safe Patching**
 - **Challenge**: Fear of breaking production systems
 - **Solution**: Pre-patch snapshots + validation + automated rollback + maintenance windows
-- **Benefit**: 99.9% success rate with zero data loss and compliance adherence
 
 **5. VPC-Native Security**
 - **Why**: Defense-in-depth security model
