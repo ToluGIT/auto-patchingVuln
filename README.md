@@ -1,5 +1,5 @@
 
-# AWS Vulnerability Auto-Patching System
+# AWS Vulnerability Auto-Patching
 
 
 **One-liner**: Event-driven,vulnerability remediation system that reduces security exposure time from weeks to hours while eliminating manual patching overhead.
@@ -8,8 +8,7 @@
 
 ### **Core Components**
 
-
-![AWS Vulnerability Patching Architecture](../AWSVuln.png)
+![AWS Vulnerability Patching Architecture](./AWSVuln.png)
  
 ### **Key Technical Decisions**
 
