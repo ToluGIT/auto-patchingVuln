@@ -7,27 +7,10 @@
 ---
 
 ### **Core Components**
-```
-┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   Inspector2    │───►│   EventBridge    │───►│ Main Lambda     │
-│  (Vulnerability │    │ (Vuln Events +   │    │ (Deduplication  │
-│   Detection)    │    │  Cron Schedule)  │    │ & Orchestration)│
-└─────────────────┘    └─────────┬────────┘    └─────────────────┘
-                                │                       │
-                                ▼                       ▼
-                    ┌─────────────────┐    ┌─────────────────┐
-                    │ Scheduler Lambda│    │   DynamoDB      │
-                    │  (Maintenance   │◄──►│ (State Mgmt &   │
-                    │   Window Mgmt)  │    │  Scheduling)    │
-                    └─────────────────┘    └─────────────────┘
-                                                   │
-                                                   ▼
-┌─────────────────┐    ┌──────────────┐    ┌─────────────────┐
-│   CloudWatch    │◄───│   SNS Topic  │◄───│ SSM Automation  │
-│  (Monitoring)   │    │(Notifications)│    │   (Patching)    │
-└─────────────────┘    └──────────────┘    └─────────────────┘
-```
 
+
+![AWS Vulnerability Patching Architecture](../AWSVuln.png)
+ 
 ### **Key Technical Decisions**
 
 **1. Dual Lambda Architecture**
